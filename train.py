@@ -103,6 +103,7 @@ def main(args):
         csv_path, args.graph_path, chunksize=args.chunksize,
         force_rebuild=args.rebuild, make_undirected=not args.directed,
         max_transactions=args.max_transactions or None,
+        sample_seed=args.seed,
     )
     data = make_splits(data, args.seed, args.val_size, args.test_size)
     print(f"Device: {device}")
@@ -204,7 +205,7 @@ if __name__ == "__main__":
     p.add_argument("--chunksize", type=int, default=250_000)
     p.add_argument(
         "--max-transactions", type=int, default=100_000,
-        help="Use only the first N rows to limit memory; use 0 for the full CSV."
+        help="Sample N rows uniformly across the CSV to limit memory; use 0 for all rows."
     )
     p.add_argument("--rebuild", action="store_true")
     p.add_argument("--directed", action="store_true")
