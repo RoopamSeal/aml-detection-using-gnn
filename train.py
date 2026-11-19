@@ -1,170 +1,139 @@
-"""Train and evaluate the small AML GAT baseline."""
-import argparse
-import json
-import random
+"""Mini-batch, chronological AML transaction classification using an edge-aware GAT."""
+import argparse, json, random
 from pathlib import Path
-
-import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
-from sklearn.metrics import (
-    average_precision_score, confusion_matrix, f1_score,
-    precision_score, recall_score, roc_auc_score
-)
-from sklearn.model_selection import train_test_split
+from torch import nn
+from sklearn.metrics import (average_precision_score, confusion_matrix,
+    f1_score, precision_score, recall_score, roc_auc_score)
+from dataset import load_aml_graph, NeighborhoodSampler
+from model import TransactionGAT
 
-from dataset import build_graph
-from model import AMLGAT
 
-def seed_everything(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+def set_seed(seed):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
 
-def make_masks(data, seed=42):
-    ids = np.arange(data.num_nodes)
-    y = data.y.numpy().astype(int)
-    train_ids, temp_ids = train_test_split(
-        ids, test_size=0.30, random_state=seed, stratify=y
+
+def make_batch(g, sampler, ids, device, excluded=None):
+    seeds = np.concatenate([g.src[ids], g.dst[ids]])
+    nodes, ei, ea, mp = sampler.sample(seeds, excluded_txids=excluded)
+    qs = np.asarray([mp[int(v)] for v in g.src[ids]], dtype=np.int64)
+    qd = np.asarray([mp[int(v)] for v in g.dst[ids]], dtype=np.int64)
+    return (
+        torch.as_tensor(g.x[nodes], dtype=torch.float32, device=device),
+        torch.as_tensor(ei, dtype=torch.long, device=device),
+        torch.as_tensor(ea, dtype=torch.float32, device=device),
+        torch.as_tensor(qs, dtype=torch.long, device=device),
+        torch.as_tensor(qd, dtype=torch.long, device=device),
+        torch.as_tensor(g.edge_attr[ids], dtype=torch.float32, device=device),
+        torch.as_tensor(g.y[ids], dtype=torch.float32, device=device),
     )
-    val_ids, test_ids = train_test_split(
-        temp_ids, test_size=0.50, random_state=seed, stratify=y[temp_ids]
-    )
-    data.train_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
-    data.val_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
-    data.test_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
-    data.train_mask[train_ids] = True
-    data.val_mask[val_ids] = True
-    data.test_mask[test_ids] = True
-    return data
 
-def calculate_metrics(logits, labels, threshold=0.5):
-    probabilities = torch.sigmoid(logits).detach().cpu().numpy()
-    y_true = labels.detach().cpu().numpy().astype(int)
-    predictions = (probabilities >= threshold).astype(int)
-    return {
-        "threshold": float(threshold),
-        "precision": float(precision_score(y_true, predictions, zero_division=0)),
-        "recall": float(recall_score(y_true, predictions, zero_division=0)),
-        "f1": float(f1_score(y_true, predictions, zero_division=0)),
-        "roc_auc": float(roc_auc_score(y_true, probabilities)) if len(np.unique(y_true)) == 2 else None,
-        "pr_auc": float(average_precision_score(y_true, probabilities)),
-        "confusion_matrix": confusion_matrix(y_true, predictions).tolist(),
+
+def iter_batches(indices, size, shuffle=False):
+    ids = np.asarray(indices).copy()
+    if shuffle: np.random.shuffle(ids)
+    for i in range(0, len(ids), size): yield ids[i:i+size]
+
+
+def evaluate(model, g, sampler, indices, batch_size, device, criterion=None):
+    model.eval(); probs, labels = [], []; loss_sum = 0.; count = 0
+    with torch.no_grad():
+        for ids in iter_batches(indices, batch_size):
+            x, ei, ea, qs, qd, qa, y = make_batch(g, sampler, ids, device)
+            logits = model(x, ei, ea, qs, qd, qa)
+            if criterion is not None:
+                loss_sum += criterion(logits, y).item() * len(ids); count += len(ids)
+            probs.append(torch.sigmoid(logits).cpu().numpy()); labels.append(y.cpu().numpy())
+    yt, yp = np.concatenate(labels).astype(int), np.concatenate(probs)
+    yh = (yp >= .5).astype(int)
+    out = {
+        "precision": float(precision_score(yt, yh, zero_division=0)),
+        "recall": float(recall_score(yt, yh, zero_division=0)),
+        "f1": float(f1_score(yt, yh, zero_division=0)),
+        "confusion_matrix": confusion_matrix(yt, yh).tolist(),
+        "roc_auc": float(roc_auc_score(yt, yp)) if len(np.unique(yt)) == 2 else None,
+        "pr_auc": float(average_precision_score(yt, yp)) if len(np.unique(yt)) == 2 else None,
     }
+    if criterion is not None and count: out["loss"] = loss_sum / count
+    return out
 
-@torch.no_grad()
-def evaluate(model, data, mask, device):
-    model.eval()
-    logits = model(data.x.to(device), data.edge_index.to(device), data.edge_attr.to(device))
-    return calculate_metrics(logits[mask.to(device)], data.y[mask].to(device))
 
 def main(args):
-    seed_everything(args.seed)
+    set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     print("Device:", device)
+    g = load_aml_graph(args.csv, args.max_transactions, args.train_ratio, args.val_ratio)
+    sampler = NeighborhoodSampler(g.x.shape[0], g.context_src, g.context_dst,
+        g.context_attr, g.context_txid, fanout=args.neighbors, num_hops=2, seed=args.seed)
 
-    data = build_graph(args.csv, max_transactions=args.max_transactions, seed=args.seed)
-    data = make_masks(data, args.seed)
+    pos = float(g.y[g.train_idx].sum()); neg = len(g.train_idx) - pos
+    if pos == 0: raise ValueError("No positive laundering examples in training split.")
+    criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([neg / pos], device=device))
+    model = TransactionGAT(g.x.shape[1], g.edge_attr.shape[1],
+                           args.hidden_channels, args.dropout).to(device)
+    # SGD is intentionally used as requested.
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.learning_rate,
+                                momentum=args.momentum, weight_decay=args.weight_decay)
 
-    for name, mask in [("Train", data.train_mask), ("Validation", data.val_mask), ("Test", data.test_mask)]:
-        print(f"{name:10s}: {int(mask.sum()):,} accounts | positive rate {data.y[mask].mean().item():.3%}")
-
-    data = data.to(device)
-    model = AMLGAT(
-        in_channels=data.x.size(1),
-        edge_dim=data.edge_attr.size(1),
-        hidden_channels=args.hidden_channels,
-        dropout=args.dropout,
-    ).to(device)
-
-    positives = data.y[data.train_mask].sum()
-    negatives = data.train_mask.sum() - positives
-    pos_weight = (negatives / positives.clamp(min=1)).to(device)
-    loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-
-    best_val_ap = -1.0
-    best_epoch = 0
-    patience_left = args.patience
-    history = []
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-
+    outdir = Path(args.output_dir); outdir.mkdir(parents=True, exist_ok=True)
+    best_score = -1.; best_path = outdir / "best_gat.pt"; history = []
     for epoch in range(1, args.epochs + 1):
-        model.train()
-        optimizer.zero_grad()
-        logits = model(data.x, data.edge_index, data.edge_attr)
-        loss = loss_fn(logits[data.train_mask], data.y[data.train_mask])
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
-        optimizer.step()
+        model.train(); total_loss = 0.; seen = 0
+        for ids in iter_batches(g.train_idx, args.train_batch_size, shuffle=True):
+            # Exclude target training edges from their own sampled graph context.
+            x, ei, ea, qs, qd, qa, y = make_batch(g, sampler, ids, device, excluded=ids)
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(x, ei, ea, qs, qd, qa)
+            loss = criterion(logits, y); loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 2.)
+            optimizer.step(); total_loss += loss.item() * len(ids); seen += len(ids)
+        train_loss = total_loss / max(seen, 1)
+        val = evaluate(model, g, sampler, g.val_idx, args.test_batch_size, device, criterion)
+        score = val["pr_auc"] if val["pr_auc"] is not None else -1.
+        history.append({"epoch": epoch, "train_loss": train_loss,
+                        "val_loss": val.get("loss"), "val_pr_auc": val["pr_auc"],
+                        "val_roc_auc": val["roc_auc"], "val_f1": val["f1"]})
+        print(f"Epoch {epoch:03d}/{args.epochs} | train_loss={train_loss:.5f} | "
+              f"val_loss={val['loss']:.5f} | val_PR-AUC={score:.5f} | val_ROC-AUC={val['roc_auc']}")
+        if score > best_score:
+            best_score = score
+            torch.save({"model_state_dict": model.state_dict(), "epoch": epoch,
+                        "validation_metrics": val, "config": vars(args)}, best_path)
 
-        val = evaluate(model, data, data.val_mask, device)
-        row = {"epoch": epoch, "train_loss": float(loss.item()), **val}
-        history.append(row)
-        print(
-            f"Epoch {epoch:02d}/{args.epochs} | loss={loss.item():.4f} "
-            f"| val PR-AUC={val['pr_auc']:.4f} | val F1={val['f1']:.4f}"
-        )
-
-        if val["pr_auc"] > best_val_ap:
-            best_val_ap = val["pr_auc"]
-            best_epoch = epoch
-            patience_left = args.patience
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "in_channels": data.x.size(1),
-                "edge_dim": data.edge_attr.size(1),
-                "hidden_channels": args.hidden_channels,
-                "dropout": args.dropout,
-                "epoch": epoch,
-            }, Path(args.output_dir) / "best_gat.pt")
-        else:
-            patience_left -= 1
-            if patience_left <= 0:
-                print("Early stopping.")
-                break
-
-    checkpoint = torch.load(Path(args.output_dir) / "best_gat.pt", map_location=device, weights_only=False)
+    checkpoint = torch.load(best_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
-    test_metrics = evaluate(model, data, data.test_mask, device)
+    test = evaluate(model, g, sampler, g.test_idx, args.test_batch_size, device)
+    result = {"best_epoch": int(checkpoint["epoch"]),
+              "best_validation_metrics": checkpoint["validation_metrics"],
+              "test_metrics": test, "config": vars(args),
+              "protocol": "Chronological transaction split; training-period graph only; each training batch's target edges are excluded from its sampled context."}
+    (outdir / "metrics.json").write_text(json.dumps(result, indent=2))
+    pd.DataFrame(history).to_csv(outdir / "training_history.csv", index=False)
+    print("\nTEST METRICS")
+    for k, v in test.items(): print(f"{k}: {v}")
+    print(f"\nSaved checkpoint: {best_path}\nSaved metrics: {outdir/'metrics.json'}")
 
-    results = {
-        "best_epoch": best_epoch,
-        "best_validation_pr_auc": best_val_ap,
-        "test_metrics": test_metrics,
-        "history": history,
-        "note": "Account labels are derived from Is Laundering on sampled transactions; this is a transductive educational baseline."
-    }
-    with open(Path(args.output_dir) / "metrics.json", "w") as f:
-        json.dump(results, f, indent=2)
-
-    epochs = [r["epoch"] for r in history]
-    plt.figure(figsize=(7, 4))
-    plt.plot(epochs, [r["train_loss"] for r in history], marker="o")
-    plt.xlabel("Epoch"); plt.ylabel("Training loss"); plt.title("Training loss")
-    plt.tight_layout(); plt.savefig(Path(args.output_dir) / "training_loss.png", dpi=150); plt.close()
-
-    plt.figure(figsize=(7, 4))
-    plt.plot(epochs, [r["pr_auc"] for r in history], marker="o")
-    plt.xlabel("Epoch"); plt.ylabel("Validation PR-AUC"); plt.title("Validation PR-AUC")
-    plt.tight_layout(); plt.savefig(Path(args.output_dir) / "validation_pr_auc.png", dpi=150); plt.close()
-
-    print("\nHeld-out test results:")
-    print(json.dumps(test_metrics, indent=2))
-    print(f"\nSaved checkpoint and metrics in {args.output_dir}/")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", default=None, help="Optional path to HI-Small_Trans.csv")
-    parser.add_argument("--max-transactions", type=int, default=25000)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--patience", type=int, default=5)
-    parser.add_argument("--hidden-channels", type=int, default=16)
-    parser.add_argument("--dropout", type=float, default=0.25)
-    parser.add_argument("--lr", type=float, default=0.003)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output-dir", default="artifacts")
-    parser.add_argument("--cpu", action="store_true")
-    main(parser.parse_args())
+    p = argparse.ArgumentParser()
+    p.add_argument("--csv", default="data/kaggle/HI-Small_Trans.csv")
+    p.add_argument("--max-transactions", type=int, default=100_000)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--train-batch-size", type=int, default=256)
+    p.add_argument("--test-batch-size", type=int, default=256)
+    p.add_argument("--learning-rate", type=float, default=0.0001)
+    p.add_argument("--optimizer", choices=["SGD"], default="SGD")
+    p.add_argument("--momentum", type=float, default=0.9)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--hidden-channels", type=int, default=16)
+    p.add_argument("--dropout", type=float, default=0.25)
+    p.add_argument("--neighbors", type=int, default=5)
+    p.add_argument("--train-ratio", type=float, default=.70)
+    p.add_argument("--val-ratio", type=float, default=.15)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--output-dir", default="artifacts")
+    p.add_argument("--cpu", action="store_true")
+    main(p.parse_args())
