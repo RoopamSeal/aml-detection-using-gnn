@@ -247,8 +247,12 @@ def build_graph(csv_path: str | Path, chunksize: int = 250_000,
             + [f"payment_format={f}" for f in formats],
         "label_definition": "1 if account is either endpoint of at least one laundering transaction",
     }
+    source_path = Path(csv_path).resolve()
+    source_stat = source_path.stat()
     data.metadata_json = json.dumps({
-        "source_csv": str(csv_path),
+        "source_csv": str(source_path),
+        "source_size_bytes": source_stat.st_size,
+        "source_mtime_ns": source_stat.st_mtime_ns,
         "transactions_in_csv": int(n_rows),
         "num_accounts": int(data.num_nodes),
         "num_directed_edges_after_option": int(data.edge_index.size(1)),
@@ -273,9 +277,24 @@ def load_or_build_graph(csv_path: str | Path, processed_path: str | Path,
     processed_path = Path(processed_path)
     if processed_path.exists() and not force_rebuild:
         try:
-            return torch.load(processed_path, map_location="cpu", weights_only=False)
-        except TypeError:  # older PyTorch
-            return torch.load(processed_path, map_location="cpu")
+            try:
+                cached = torch.load(processed_path, map_location="cpu", weights_only=False)
+            except TypeError:  # older PyTorch
+                cached = torch.load(processed_path, map_location="cpu")
+            source_path = Path(locate_transaction_csv(csv_path)).resolve()
+            source_stat = source_path.stat()
+            metadata = json.loads(getattr(cached, "metadata_json", "{}"))
+            cache_matches = (
+                metadata.get("source_csv") == str(source_path)
+                and metadata.get("source_size_bytes") == source_stat.st_size
+                and metadata.get("source_mtime_ns") == source_stat.st_mtime_ns
+                and metadata.get("make_undirected") == make_undirected
+            )
+            if cache_matches:
+                return cached
+            print("Cached graph does not match the selected CSV or edge direction; rebuilding.")
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError, AttributeError):
+            print("Could not validate the cached graph; rebuilding.")
     return build_graph(csv_path, chunksize, make_undirected, processed_path)
 
 
