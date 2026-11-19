@@ -7,7 +7,7 @@ Educational, account-level node-classification project using the IBM AML transac
 - `dataset.py` — KaggleHub download, chunked CSV preprocessing, graph construction.
 - `model.py` — two-layer, edge-aware Graph Attention Network.
 - `train.py` — stratified node split, neighbor sampling, weighted loss, validation and test metrics.
-- `aml_gat_walkthrough.ipynb` — guided notebook with explanations and hands-on model steps.
+- `anti-money-laundering-detection-with-gnn.ipynb` — guided notebook with explanations and hands-on model steps.
 
 ## 1. Environment
 
@@ -23,7 +23,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Install a PyTorch build suitable for your CUDA version from the official PyTorch selector if you want GPU support. PyG installation instructions can vary with the PyTorch version; see https://pytorch-geometric.readthedocs.io/.
+Install a PyTorch build suitable for your CUDA version from the official PyTorch selector if you want GPU support. `NeighborLoader` also needs either `pyg-lib` or `torch-sparse`; these wheels must match your installed PyTorch and CUDA versions. Follow the matching installation command at https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html before running training. The script checks for this sampling backend before downloading the dataset and prints the setup link if it is missing.
 
 ## 2. Kaggle access and download
 
