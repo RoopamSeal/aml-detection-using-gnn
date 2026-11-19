@@ -138,7 +138,9 @@ def main(args):
     n_neg = float(data.train_mask.sum()) - n_pos
     pos_weight = torch.tensor([n_neg / max(n_pos, 1.0)], device=device)
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = torch.optim.SGD(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
 
     best_val_ap = -1.0
     history = []
@@ -211,15 +213,15 @@ if __name__ == "__main__":
     p.add_argument("--directed", action="store_true")
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--batch-size", type=int, default=1024)
+    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--neighbors", type=int, default=15)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--hidden-channels", type=int, default=32)
     p.add_argument("--heads", type=int, default=4)
     p.add_argument("--dropout", type=float, default=0.3)
-    p.add_argument("--lr", type=float, default=0.003)
-    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=0.0001)
+    p.add_argument("--weight-decay", type=float, default=0.0)
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--val-size", type=float, default=0.15)
     p.add_argument("--test-size", type=float, default=0.15)
