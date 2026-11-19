@@ -1,5 +1,5 @@
 import torch
-from model import GAT
+from model import AML_GAT
 from dataset import AMLtoGraph
 import torch_geometric.transforms as T
 from torch_geometric.loader import NeighborLoader
