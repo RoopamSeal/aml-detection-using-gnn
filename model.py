@@ -51,4 +51,4 @@ class AMLGAT(nn.Module):
 
 
 # Backward-compatible class name
-GAT = AMLGAT
+AMLGAT = GAT
