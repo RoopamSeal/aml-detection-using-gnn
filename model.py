@@ -1,23 +1,54 @@
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch_geometric.transforms as T
-from torch_geometric.nn import GATConv, Linear
+from torch_geometric.nn import GATConv
 
-class GAT(torch.nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, heads):
+
+class AMLGAT(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        hidden_channels=32,
+        heads=4,
+        edge_dim=None,
+        dropout=0.3
+    ):
         super().__init__()
-        self.conv1 = GATConv(in_channels, hidden_channels, heads, dropout=0.6)
-        self.conv2 = GATConv(hidden_channels * heads, int(hidden_channels/4), heads=1, concat=False, dropout=0.6)
-        self.lin = Linear(int(hidden_channels/4), out_channels)
-        self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x, edge_index, edge_attr):
-        x = F.dropout(x, p=0.6, training=self.training)
-        x = F.elu(self.conv1(x, edge_index, edge_attr))
-        x = F.dropout(x, p=0.6, training=self.training)
-        x = F.elu(self.conv2(x, edge_index, edge_attr))
-        x = self.lin(x)
-        x = self.sigmoid(x)
-        
-        return x
+        self.dropout = dropout
+
+        self.gat1 = GATConv(
+            in_channels,
+            hidden_channels,
+            heads=heads,
+            concat=True,
+            edge_dim=edge_dim
+        )
+
+        self.gat2 = GATConv(
+            hidden_channels * heads,
+            hidden_channels,
+            heads=1,
+            concat=False,
+            edge_dim=edge_dim
+        )
+
+        self.classifier = nn.Linear(hidden_channels, 1)
+
+    def forward(self, x, edge_index, edge_attr=None):
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        x = self.gat1(x, edge_index, edge_attr=edge_attr)
+        x = F.elu(x)
+
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        x = self.gat2(x, edge_index, edge_attr=edge_attr)
+        x = F.elu(x)
+
+        return self.classifier(x).squeeze(-1)
+
+
+# Backward-compatible class name
+GAT = AMLGAT
