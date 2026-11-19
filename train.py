@@ -9,14 +9,25 @@ from pathlib import Path
 import numpy as np
 import torch
 from sklearn.metrics import (
-    average_precision_score, classification_report, confusion_matrix,
+    average_precision_score, confusion_matrix,
     f1_score, precision_score, recall_score, roc_auc_score,
 )
 from sklearn.model_selection import train_test_split
 from torch_geometric.loader import NeighborLoader
+from torch_geometric.typing import WITH_PYG_LIB, WITH_TORCH_SPARSE
 
 from dataset import download_kaggle_dataset, locate_transaction_csv, load_or_build_graph
 from model import AMLGAT
+
+
+def require_neighbor_sampling_backend():
+    """Fail early with setup guidance when PyG sampling extensions are missing."""
+    if not (WITH_PYG_LIB or WITH_TORCH_SPARSE):
+        raise RuntimeError(
+            "NeighborLoader requires either pyg-lib or torch-sparse. Install a "
+            "wheel matching your PyTorch and CUDA versions using the official "
+            "PyG instructions: https://pytorch-geometric.readthedocs.io/en/latest/install/installation.html"
+        )
 
 
 def seed_everything(seed: int):
@@ -81,6 +92,7 @@ def evaluate(model, data, loader, device, threshold=0.5):
 
 
 def main(args):
+    require_neighbor_sampling_backend()
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     source = args.csv
