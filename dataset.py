@@ -35,7 +35,7 @@ REQUIRED_COLUMNS = [
 
 
 def download_kaggle_dataset(dataset_slug: str = KAGGLE_DATASET,
-                            download_dir: str = "data/kaggle",
+                            download_dir: str = "data/raw",
                             filename: str = DEFAULT_FILENAME) -> Path:
     """Download only the requested CSV through KaggleHub; credentials may be required."""
     try:
