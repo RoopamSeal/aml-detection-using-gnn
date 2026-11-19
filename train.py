@@ -97,7 +97,7 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     source = args.csv
     if source is None:
-        source = download_kaggle_dataset()
+        source = download_kaggle_dataset(filename=args.filename)
     csv_path = locate_transaction_csv(source, args.filename)
     data = load_or_build_graph(
         csv_path, args.graph_path, chunksize=args.chunksize,
