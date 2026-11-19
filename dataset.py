@@ -1,121 +1,128 @@
-"""Load a small IBM AML transaction sample and convert it into a PyG graph."""
+"""Chronological transaction graph and lightweight neighborhood sampler."""
+from dataclasses import dataclass
 from pathlib import Path
 import numpy as np
 import pandas as pd
-import torch
-import kagglehub
-from torch_geometric.data import Data
 
-DATASET = "ealtman2019/ibm-transactions-for-anti-money-laundering-aml"
-FILENAME = "HI-Small_Trans.csv"
+@dataclass
+class AMLGraph:
+    x: np.ndarray
+    src: np.ndarray
+    dst: np.ndarray
+    edge_attr: np.ndarray
+    y: np.ndarray
+    train_idx: np.ndarray
+    val_idx: np.ndarray
+    test_idx: np.ndarray
+    context_src: np.ndarray
+    context_dst: np.ndarray
+    context_attr: np.ndarray
+    context_txid: np.ndarray
 
-def download_dataset():
-    """Download the Kaggle dataset. Configure Kaggle credentials in Codespaces first."""
-    folder = Path(kagglehub.dataset_download(DATASET))
-    matches = list(folder.rglob(FILENAME))
-    if not matches:
-        matches = list(folder.rglob("*Small*Trans.csv"))
-    if not matches:
-        raise FileNotFoundError(f"Could not find {FILENAME} under {folder}")
-    return matches[0]
 
-def build_graph(csv_path=None, max_transactions=25000, seed=42):
-    """
-    Build an account graph from the first max_transactions rows of HI-Small_Trans.csv.
+def load_aml_graph(csv_path, max_transactions=100_000, train_ratio=.70, val_ratio=.15):
+    path = Path(csv_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"CSV not found: {path.resolve()}")
+    cols = ["Timestamp", "From Bank", "Account", "To Bank", "Account.1", "Amount Paid", "Is Laundering"]
+    df = pd.read_csv(path, usecols=cols, nrows=max_transactions)
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+    df["Amount Paid"] = pd.to_numeric(df["Amount Paid"], errors="coerce")
+    df["Is Laundering"] = pd.to_numeric(df["Is Laundering"], errors="coerce")
+    df = df.dropna(subset=cols).copy()
+    df = df[df["Is Laundering"].isin([0, 1])]
+    df["Is Laundering"] = df["Is Laundering"].astype(int)
+    df["Amount Paid"] = df["Amount Paid"].clip(lower=0)
+    df = df.sort_values("Timestamp", kind="stable").reset_index(drop=True)
+    n = len(df)
+    a, b = int(n * train_ratio), int(n * (train_ratio + val_ratio))
+    if n < 100 or a == 0 or b <= a or b >= n:
+        raise ValueError(f"Not enough usable transactions for split (n={n}).")
 
-    Nodes = bank/account pairs.
-    Edges = transactions (sender -> receiver).
-    Account label = 1 if it is an endpoint of a transaction labelled Is Laundering=1.
+    # One graph node per bank/account pair.
+    sk = df["From Bank"].astype(str) + "::" + df["Account"].astype(str)
+    rk = df["To Bank"].astype(str) + "::" + df["Account.1"].astype(str)
+    codes, _ = pd.factorize(pd.concat([sk, rk], ignore_index=True), sort=True)
+    src, dst = codes[:n].astype(np.int64), codes[n:].astype(np.int64)
+    nn = int(codes.max()) + 1
+    sb = pd.to_numeric(df["From Bank"], errors="coerce").fillna(0).to_numpy()
+    rb = pd.to_numeric(df["To Bank"], errors="coerce").fillna(0).to_numpy()
+    bank = np.zeros(nn, dtype=np.float64)
+    np.maximum.at(bank, src, sb); np.maximum.at(bank, dst, rb)
 
-    The small row limit is intentional for a quick Codespaces experiment.
-    """
-    csv_path = Path(csv_path) if csv_path else download_dataset()
-    usecols = [
-        "Timestamp", "From Bank", "Account", "To Bank", "Account.1",
-        "Amount Received", "Amount Paid", "Is Laundering"
-    ]
-    df = pd.read_csv(csv_path, usecols=usecols, nrows=max_transactions)
-    df = df.dropna(subset=usecols).copy()
-    if df.empty:
-        raise ValueError("No usable rows found in the selected CSV sample.")
+    y = df["Is Laundering"].to_numpy(np.float32)
+    amount = df["Amount Paid"].to_numpy(np.float64)
+    ts = df["Timestamp"].astype("int64").to_numpy(np.float64) / 1e9
+    train_idx = np.arange(a, dtype=np.int64)
+    val_idx = np.arange(a, b, dtype=np.int64)
+    test_idx = np.arange(b, n, dtype=np.int64)
 
-    # Keep account identifiers unique across banks.
-    src_key = df["From Bank"].astype(str) + "::" + df["Account"].astype(str)
-    dst_key = df["To Bank"].astype(str) + "::" + df["Account.1"].astype(str)
-    all_keys = pd.Index(pd.concat([src_key, dst_key], ignore_index=True).unique())
-    node_map = {key: idx for idx, key in enumerate(all_keys)}
-    src = src_key.map(node_map).to_numpy(dtype=np.int64)
-    dst = dst_key.map(node_map).to_numpy(dtype=np.int64)
-    n_nodes = len(all_keys)
+    # Static bank identifier feature only. We deliberately avoid account activity
+    # aggregates here because they could contain the current target transaction.
+    bankf = np.log1p(np.maximum(bank, 0))
+    bankf /= max(float(bankf.max()), 1.)
+    x = bankf.reshape(-1, 1).astype(np.float32)
 
-    paid = pd.to_numeric(df["Amount Paid"], errors="coerce").fillna(0).clip(lower=0).to_numpy()
-    received = pd.to_numeric(df["Amount Received"], errors="coerce").fillna(0).clip(lower=0).to_numpy()
-    labels = pd.to_numeric(df["Is Laundering"], errors="coerce").fillna(0).to_numpy().astype(int)
+    log_amt = np.log1p(amount)
+    amt_scale = max(float(log_amt[train_idx].max()), 1.)
+    t0 = float(ts[train_idx].min())
+    tscale = max(float(ts[train_idx].max() - t0), 1.)
+    edge_attr = np.column_stack([log_amt / amt_scale, (ts - t0) / tscale]).astype(np.float32)
 
-    # Node features: normalized bank ID, log mean paid/received, log transaction counts.
-    bank_by_key = {}
-    for bank, account in zip(df["From Bank"].astype(str), df["Account"].astype(str)):
-        bank_by_key.setdefault(bank + "::" + account, float(bank) if bank.replace(".", "", 1).isdigit() else 0.0)
-    for bank, account in zip(df["To Bank"].astype(str), df["Account.1"].astype(str)):
-        bank_by_key.setdefault(bank + "::" + account, float(bank) if bank.replace(".", "", 1).isdigit() else 0.0)
-    bank_values = np.array([bank_by_key.get(k, 0.0) for k in all_keys], dtype=np.float32)
-    bank_values = (bank_values - bank_values.min()) / max(float(bank_values.max() - bank_values.min()), 1.0)
+    # Historical message-passing graph: training edges in both directions.
+    csrc = np.concatenate([src[train_idx], dst[train_idx]])
+    cdst = np.concatenate([dst[train_idx], src[train_idx]])
+    cattr = np.concatenate([edge_attr[train_idx], edge_attr[train_idx]], axis=0)
+    ctxid = np.concatenate([train_idx, train_idx])
 
-    paid_sum = np.bincount(src, weights=paid, minlength=n_nodes)
-    recv_sum = np.bincount(dst, weights=received, minlength=n_nodes)
-    sent_count = np.bincount(src, minlength=n_nodes)
-    recv_count = np.bincount(dst, minlength=n_nodes)
-    paid_mean = paid_sum / np.maximum(sent_count, 1)
-    recv_mean = recv_sum / np.maximum(recv_count, 1)
+    print(f"Transactions: {n:,} | account nodes: {nn:,}")
+    for name, ids in [("train", train_idx), ("validation", val_idx), ("test", test_idx)]:
+        pos = int(y[ids].sum())
+        print(f"{name:10s}: {len(ids):,} rows; laundering={pos:,} ({pos/len(ids):.4%})")
+        if pos == 0 or pos == len(ids):
+            raise ValueError(f"{name} split has only one class. Increase --max-transactions or inspect date coverage.")
 
-    x = np.column_stack([
-        bank_values,
-        np.log1p(paid_mean),
-        np.log1p(recv_mean),
-        np.log1p(sent_count),
-        np.log1p(recv_count),
-    ]).astype(np.float32)
+    return AMLGraph(x, src, dst, edge_attr, y, train_idx, val_idx, test_idx,
+                    csrc, cdst, cattr, ctxid)
 
-    # Edge attributes: normalized time and log transaction amounts.
-    timestamps = pd.to_datetime(df["Timestamp"], errors="coerce", utc=True)
-    seconds = timestamps.astype("int64").to_numpy(dtype=np.float64) / 1e9
-    seconds[~timestamps.notna().to_numpy()] = np.nan
-    lo, hi = np.nanmin(seconds), np.nanmax(seconds)
-    time_feature = np.nan_to_num((seconds - lo) / max(hi - lo, 1.0), nan=0.0)
-    edge_attr = np.column_stack([
-        time_feature,
-        np.log1p(paid),
-        np.log1p(received),
-    ]).astype(np.float32)
 
-    # Account-level proxy labels: either endpoint of a flagged transaction.
-    y = np.zeros(n_nodes, dtype=np.float32)
-    positive_edges = labels == 1
-    y[src[positive_edges]] = 1.0
-    y[dst[positive_edges]] = 1.0
+class NeighborhoodSampler:
+    """Two-hop fanout sampler; does not require pyg-lib or torch-sparse."""
+    def __init__(self, num_nodes, edge_src, edge_dst, edge_attr, edge_txid,
+                 fanout=5, num_hops=2, seed=42):
+        self.edge_src, self.edge_dst = edge_src, edge_dst
+        self.edge_attr, self.edge_txid = edge_attr, edge_txid
+        self.fanout, self.num_hops = fanout, num_hops
+        self.rng = np.random.default_rng(seed)
+        self.adj = [[] for _ in range(num_nodes)]
+        for eid, (u, v) in enumerate(zip(edge_src, edge_dst)):
+            self.adj[int(u)].append((int(v), eid))
 
-    # Bidirectional message passing; each transaction's features are copied to its reverse edge.
-    edge_index = np.vstack([src, dst])
-    edge_index = np.concatenate([edge_index, edge_index[::-1]], axis=1)
-    edge_attr = np.concatenate([edge_attr, edge_attr], axis=0)
-
-    data = Data(
-        x=torch.tensor(x, dtype=torch.float32),
-        edge_index=torch.tensor(edge_index, dtype=torch.long),
-        edge_attr=torch.tensor(edge_attr, dtype=torch.float32),
-        y=torch.tensor(y, dtype=torch.float32),
-        num_nodes=n_nodes,
-    )
-    data.num_transactions = int(len(df))
-    data.num_laundering_transactions = int(labels.sum())
-    data.account_keys = list(all_keys)
-    print(f"Loaded {len(df):,} transactions")
-    print(f"Graph: {n_nodes:,} accounts | {data.edge_index.size(1):,} directed message edges")
-    print(f"Positive accounts: {int(y.sum()):,} ({100*y.mean():.3f}%)")
-    return data
-
-if __name__ == "__main__":
-    graph = build_graph()
-    Path("data/processed").mkdir(parents=True, exist_ok=True)
-    torch.save(graph, "data/processed/aml_graph.pt")
-    print("Saved data/processed/aml_graph.pt")
+    def sample(self, seeds, excluded_txids=None):
+        excluded = set() if excluded_txids is None else set(map(int, excluded_txids))
+        nodes, frontier, eids = set(map(int, seeds)), set(map(int, seeds)), set()
+        for _ in range(self.num_hops):
+            nxt = set()
+            for u in frontier:
+                cand = [p for p in self.adj[u] if int(self.edge_txid[p[1]]) not in excluded]
+                if len(cand) > self.fanout:
+                    take = self.rng.choice(len(cand), self.fanout, replace=False)
+                    cand = [cand[int(i)] for i in take]
+                for v, eid in cand:
+                    eids.add(eid)
+                    if v not in nodes: nxt.add(v)
+            nodes.update(nxt); frontier = nxt
+            if not frontier: break
+        local_nodes = np.asarray(sorted(nodes), dtype=np.int64)
+        mapping = {int(v): i for i, v in enumerate(local_nodes)}
+        if eids:
+            ids = np.asarray(sorted(eids), dtype=np.int64)
+            ei = np.vstack([
+                [mapping[int(v)] for v in self.edge_src[ids]],
+                [mapping[int(v)] for v in self.edge_dst[ids]],
+            ]).astype(np.int64)
+            ea = self.edge_attr[ids]
+        else:
+            ei = np.empty((2, 0), dtype=np.int64)
+            ea = np.empty((0, self.edge_attr.shape[1]), dtype=np.float32)
+        return local_nodes, ei, ea, mapping
