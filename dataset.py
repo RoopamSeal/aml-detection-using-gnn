@@ -78,11 +78,23 @@ def _account_key(bank: pd.Series, account: pd.Series) -> pd.Series:
     return bank.astype(str) + "::" + account.astype(str)
 
 
-def _scan_metadata(csv_path: Path, chunksize: int, max_transactions: Optional[int] = None):
+def _scan_metadata(
+    csv_path: Path,
+    chunksize: int,
+    max_transactions: Optional[int] = None,
+    sample_seed: int = 42,
+):
+    """Read metadata and choose a reproducible uniform sample across the full CSV."""
     currencies, formats = set(), set()
     min_time, max_time = None, None
     rows = 0
-    for chunk in pd.read_csv(csv_path, usecols=REQUIRED_COLUMNS, chunksize=chunksize, nrows=max_transactions):
+    sample_indices = np.empty(0, dtype=np.int64)
+    sample_scores = np.empty(0, dtype=np.float64)
+    rng = np.random.default_rng(sample_seed)
+
+    # Scan the whole file so a bounded sample represents early and late rows,
+    # instead of only using the CSV prefix.
+    for chunk in pd.read_csv(csv_path, usecols=REQUIRED_COLUMNS, chunksize=chunksize):
         for col in ("Payment Currency", "Receiving Currency"):
             currencies.update(chunk[col].dropna().astype(str).unique().tolist())
         formats.update(chunk["Payment Format"].dropna().astype(str).unique().tolist())
@@ -91,16 +103,34 @@ def _scan_metadata(csv_path: Path, chunksize: int, max_transactions: Optional[in
         if pd.notna(lo):
             min_time = lo if min_time is None else min(min_time, lo)
             max_time = hi if max_time is None else max(max_time, hi)
+
+        if max_transactions is not None:
+            chunk_indices = np.arange(rows, rows + len(chunk), dtype=np.int64)
+            candidate_indices = np.concatenate((sample_indices, chunk_indices))
+            candidate_scores = np.concatenate((sample_scores, rng.random(len(chunk))))
+            if len(candidate_indices) > max_transactions:
+                keep = np.argpartition(candidate_scores, max_transactions - 1)[:max_transactions]
+                sample_indices = candidate_indices[keep]
+                sample_scores = candidate_scores[keep]
+            else:
+                sample_indices = candidate_indices
+                sample_scores = candidate_scores
         rows += len(chunk)
+
     if not currencies or not formats or min_time is None or max_time is None:
         raise ValueError("Could not read currency, payment-format, or timestamp metadata.")
-    return sorted(currencies), sorted(formats), min_time, max_time, rows
+    if max_transactions is None or max_transactions >= rows:
+        sample_indices = None
+    else:
+        sample_indices.sort()
+    return sorted(currencies), sorted(formats), min_time, max_time, rows, sample_indices
 
 
 def build_graph(csv_path: str | Path, chunksize: int = 250_000,
                 make_undirected: bool = True,
                 output_path: Optional[str | Path] = None,
-                max_transactions: Optional[int] = None) -> Data:
+                max_transactions: Optional[int] = None,
+                sample_seed: int = 42) -> Data:
     """
     Create a PyG Data object.
 
@@ -121,11 +151,15 @@ def build_graph(csv_path: str | Path, chunksize: int = 250_000,
     csv_path = locate_transaction_csv(csv_path)
     if max_transactions is not None and max_transactions <= 0:
         raise ValueError("max_transactions must be positive or None.")
-    currencies, formats, min_time, max_time, n_rows = _scan_metadata(
-        csv_path, chunksize, max_transactions
+    currencies, formats, min_time, max_time, total_rows, sample_indices = _scan_metadata(
+        csv_path, chunksize, max_transactions, sample_seed
     )
-    if max_transactions is not None:
-        print(f"Building graph from the first {n_rows:,} transactions (limit={max_transactions:,}).")
+    sampled_rows = total_rows if sample_indices is None else len(sample_indices)
+    if max_transactions is not None and sampled_rows < total_rows:
+        print(
+            f"Building graph from a deterministic sample of {sampled_rows:,} "
+            f"transactions drawn across {total_rows:,} rows."
+        )
     currency_to_idx = {v: i for i, v in enumerate(currencies)}
     format_to_idx = {v: i for i, v in enumerate(formats)}
     c_count, f_count = len(currencies), len(formats)
@@ -154,7 +188,17 @@ def build_graph(csv_path: str | Path, chunksize: int = 250_000,
         return account_to_id[key]
 
     time_span = max((max_time - min_time).total_seconds(), 1.0)
-    for chunk in pd.read_csv(csv_path, usecols=REQUIRED_COLUMNS, chunksize=chunksize, nrows=max_transactions):
+    row_offset = 0
+    for chunk in pd.read_csv(csv_path, usecols=REQUIRED_COLUMNS, chunksize=chunksize):
+        chunk_end = row_offset + len(chunk)
+        if sample_indices is not None:
+            first = np.searchsorted(sample_indices, row_offset, side="left")
+            last = np.searchsorted(sample_indices, chunk_end, side="left")
+            local_indices = sample_indices[first:last] - row_offset
+            chunk = chunk.iloc[local_indices]
+        row_offset = chunk_end
+        if chunk.empty:
+            continue
         chunk = chunk.dropna(subset=[
             "Timestamp", "From Bank", "Account", "To Bank", "Account.1",
             "Amount Received", "Receiving Currency", "Amount Paid",
@@ -244,7 +288,7 @@ def build_graph(csv_path: str | Path, chunksize: int = 250_000,
         y=torch.from_numpy(y_np).float(),
         num_nodes=len(account_to_id),
     )
-    data.num_transactions = int(n_rows)
+    data.num_transactions = int(sampled_rows)
     data.currency_names = currencies
     data.payment_format_names = formats
     data.feature_notes = {
@@ -263,8 +307,10 @@ def build_graph(csv_path: str | Path, chunksize: int = 250_000,
         "source_csv": str(source_path),
         "source_size_bytes": source_stat.st_size,
         "source_mtime_ns": source_stat.st_mtime_ns,
-        "transactions_in_csv": int(n_rows),
+        "transactions_in_csv": int(total_rows),
+        "transactions_in_graph": int(sampled_rows),
         "max_transactions": max_transactions,
+        "sample_seed": sample_seed,
         "num_accounts": int(data.num_nodes),
         "num_directed_edges_after_option": int(data.edge_index.size(1)),
         "currencies": currencies,
@@ -285,7 +331,8 @@ def build_graph(csv_path: str | Path, chunksize: int = 250_000,
 def load_or_build_graph(csv_path: str | Path, processed_path: str | Path,
                         chunksize: int = 250_000, force_rebuild: bool = False,
                         make_undirected: bool = True,
-                        max_transactions: Optional[int] = None) -> Data:
+                        max_transactions: Optional[int] = None,
+                        sample_seed: int = 42) -> Data:
     processed_path = Path(processed_path)
     if processed_path.exists() and not force_rebuild:
         try:
@@ -302,6 +349,7 @@ def load_or_build_graph(csv_path: str | Path, processed_path: str | Path,
                 and metadata.get("source_mtime_ns") == source_stat.st_mtime_ns
                 and metadata.get("make_undirected") == make_undirected
                 and metadata.get("max_transactions") == max_transactions
+                and metadata.get("sample_seed") == sample_seed
             )
             if cache_matches:
                 return cached
@@ -309,7 +357,8 @@ def load_or_build_graph(csv_path: str | Path, processed_path: str | Path,
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError, AttributeError):
             print("Could not validate the cached graph; rebuilding.")
     return build_graph(
-        csv_path, chunksize, make_undirected, processed_path, max_transactions
+        csv_path, chunksize, make_undirected, processed_path,
+        max_transactions, sample_seed,
     )
 
 
@@ -321,8 +370,9 @@ if __name__ == "__main__":
     parser.add_argument("--chunksize", type=int, default=250_000)
     parser.add_argument(
         "--max-transactions", type=int, default=100_000,
-        help="Use only the first N rows to limit memory; use 0 for the full CSV."
+        help="Sample N rows uniformly across the CSV to limit memory; use 0 for all rows."
     )
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="data/processed/aml_graph.pt")
     parser.add_argument("--directed", action="store_true", help="Do not add reverse edges.")
     args = parser.parse_args()
@@ -334,5 +384,5 @@ if __name__ == "__main__":
     build_graph(
         csv_file, chunksize=args.chunksize, make_undirected=not args.directed,
         output_path=args.output,
-        max_transactions=args.max_transactions or None,
+        max_transactions=args.max_transactions or None, sample_seed=args.seed,
     )
