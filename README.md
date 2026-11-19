@@ -27,7 +27,7 @@ Install a PyTorch build suitable for your CUDA version from the official PyTorch
 
 ## 2. Kaggle access and download
 
-The project downloads the selected CSV directly through KaggleHub instead of downloading every dataset variant. The default is `HI-Small_Trans.csv`, recommended for a first run.
+The project downloads the selected CSV directly into `data/raw/` through KaggleHub instead of downloading every dataset variant. The default is `HI-Small_Trans.csv`, recommended for a first run.
 
 ```bash
 pip install kagglehub
@@ -86,7 +86,7 @@ This is a learning baseline, not a production AML system.
 ## 6. Train
 
 ```bash
-python train.py --epochs 30 --batch-size 256 --neighbors 8 --chunksize 50000
+python train.py --epochs 100 --batch-size 256 --lr 0.0001 --neighbors 8 --chunksize 50000
 ```
 
 If memory is tight:
