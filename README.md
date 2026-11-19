@@ -27,7 +27,7 @@ Install a PyTorch build suitable for your CUDA version from the official PyTorch
 
 ## 2. Kaggle access and download
 
-The project downloads the dataset directly through KaggleHub; it does not require manually uploading a large CSV into the notebook.
+The project downloads the selected CSV directly through KaggleHub instead of downloading every dataset variant. The default is `HI-Small_Trans.csv`, recommended for a first run.
 
 ```bash
 pip install kagglehub
@@ -47,7 +47,7 @@ Or point to an already downloaded folder/CSV:
 python train.py --csv "path/to/kaggle/dataset/folder"
 ```
 
-The dataset folder may contain multiple variants. `--filename` chooses one; the default is `HI-Small_Trans.csv`. For example, if you intentionally want the larger file and it exists in the Kaggle download:
+The default run downloads only `HI-Small_Trans.csv`. Use `--filename` to download a different file; larger variants require substantially more disk space and RAM. For example:
 
 ```bash
 python train.py --filename HI-Large_Trans.csv --rebuild
