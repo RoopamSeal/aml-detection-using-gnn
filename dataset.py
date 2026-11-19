@@ -35,8 +35,9 @@ REQUIRED_COLUMNS = [
 
 
 def download_kaggle_dataset(dataset_slug: str = KAGGLE_DATASET,
-                            download_dir: str = "data/kaggle") -> Path:
-    """Download through KaggleHub; Kaggle credentials may be required."""
+                            download_dir: str = "data/kaggle",
+                            filename: str = DEFAULT_FILENAME) -> Path:
+    """Download only the requested CSV through KaggleHub; credentials may be required."""
     try:
         import kagglehub
     except ImportError as exc:
@@ -45,7 +46,9 @@ def download_kaggle_dataset(dataset_slug: str = KAGGLE_DATASET,
             "Kaggle may ask you to authenticate (KAGGLE_USERNAME/KAGGLE_KEY "
             "or a Kaggle API token)."
         ) from exc
-    path = Path(kagglehub.dataset_download(dataset_slug, output_dir=download_dir))
+    path = Path(kagglehub.dataset_download(
+        dataset_slug, path=filename, output_dir=download_dir
+    ))
     return path
 
 
@@ -310,7 +313,7 @@ if __name__ == "__main__":
 
     source = args.csv
     if args.download or source is None:
-        source = download_kaggle_dataset()
+        source = download_kaggle_dataset(filename=args.filename)
     csv_file = locate_transaction_csv(source, args.filename)
     build_graph(csv_file, chunksize=args.chunksize,
                 make_undirected=not args.directed, output_path=args.output)
