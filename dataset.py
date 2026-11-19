@@ -78,11 +78,11 @@ def _account_key(bank: pd.Series, account: pd.Series) -> pd.Series:
     return bank.astype(str) + "::" + account.astype(str)
 
 
-def _scan_metadata(csv_path: Path, chunksize: int):
+def _scan_metadata(csv_path: Path, chunksize: int, max_transactions: Optional[int] = None):
     currencies, formats = set(), set()
     min_time, max_time = None, None
     rows = 0
-    for chunk in pd.read_csv(csv_path, usecols=REQUIRED_COLUMNS, chunksize=chunksize):
+    for chunk in pd.read_csv(csv_path, usecols=REQUIRED_COLUMNS, chunksize=chunksize, nrows=max_transactions):
         for col in ("Payment Currency", "Receiving Currency"):
             currencies.update(chunk[col].dropna().astype(str).unique().tolist())
         formats.update(chunk["Payment Format"].dropna().astype(str).unique().tolist())
@@ -99,7 +99,8 @@ def _scan_metadata(csv_path: Path, chunksize: int):
 
 def build_graph(csv_path: str | Path, chunksize: int = 250_000,
                 make_undirected: bool = True,
-                output_path: Optional[str | Path] = None) -> Data:
+                output_path: Optional[str | Path] = None,
+                max_transactions: Optional[int] = None) -> Data:
     """
     Create a PyG Data object.
 
@@ -118,7 +119,13 @@ def build_graph(csv_path: str | Path, chunksize: int = 250_000,
     forecasting evaluation. See notebook discussion before interpreting scores.
     """
     csv_path = locate_transaction_csv(csv_path)
-    currencies, formats, min_time, max_time, n_rows = _scan_metadata(csv_path, chunksize)
+    if max_transactions is not None and max_transactions <= 0:
+        raise ValueError("max_transactions must be positive or None.")
+    currencies, formats, min_time, max_time, n_rows = _scan_metadata(
+        csv_path, chunksize, max_transactions
+    )
+    if max_transactions is not None:
+        print(f"Building graph from the first {n_rows:,} transactions (limit={max_transactions:,}).")
     currency_to_idx = {v: i for i, v in enumerate(currencies)}
     format_to_idx = {v: i for i, v in enumerate(formats)}
     c_count, f_count = len(currencies), len(formats)
@@ -147,7 +154,7 @@ def build_graph(csv_path: str | Path, chunksize: int = 250_000,
         return account_to_id[key]
 
     time_span = max((max_time - min_time).total_seconds(), 1.0)
-    for chunk in pd.read_csv(csv_path, usecols=REQUIRED_COLUMNS, chunksize=chunksize):
+    for chunk in pd.read_csv(csv_path, usecols=REQUIRED_COLUMNS, chunksize=chunksize, nrows=max_transactions):
         chunk = chunk.dropna(subset=[
             "Timestamp", "From Bank", "Account", "To Bank", "Account.1",
             "Amount Received", "Receiving Currency", "Amount Paid",
@@ -257,6 +264,7 @@ def build_graph(csv_path: str | Path, chunksize: int = 250_000,
         "source_size_bytes": source_stat.st_size,
         "source_mtime_ns": source_stat.st_mtime_ns,
         "transactions_in_csv": int(n_rows),
+        "max_transactions": max_transactions,
         "num_accounts": int(data.num_nodes),
         "num_directed_edges_after_option": int(data.edge_index.size(1)),
         "currencies": currencies,
@@ -276,7 +284,8 @@ def build_graph(csv_path: str | Path, chunksize: int = 250_000,
 
 def load_or_build_graph(csv_path: str | Path, processed_path: str | Path,
                         chunksize: int = 250_000, force_rebuild: bool = False,
-                        make_undirected: bool = True) -> Data:
+                        make_undirected: bool = True,
+                        max_transactions: Optional[int] = None) -> Data:
     processed_path = Path(processed_path)
     if processed_path.exists() and not force_rebuild:
         try:
@@ -292,13 +301,16 @@ def load_or_build_graph(csv_path: str | Path, processed_path: str | Path,
                 and metadata.get("source_size_bytes") == source_stat.st_size
                 and metadata.get("source_mtime_ns") == source_stat.st_mtime_ns
                 and metadata.get("make_undirected") == make_undirected
+                and metadata.get("max_transactions") == max_transactions
             )
             if cache_matches:
                 return cached
             print("Cached graph does not match the selected CSV or edge direction; rebuilding.")
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError, AttributeError):
             print("Could not validate the cached graph; rebuilding.")
-    return build_graph(csv_path, chunksize, make_undirected, processed_path)
+    return build_graph(
+        csv_path, chunksize, make_undirected, processed_path, max_transactions
+    )
 
 
 if __name__ == "__main__":
@@ -307,6 +319,10 @@ if __name__ == "__main__":
     parser.add_argument("--download", action="store_true", help="Download the Kaggle dataset first.")
     parser.add_argument("--filename", type=str, default=DEFAULT_FILENAME)
     parser.add_argument("--chunksize", type=int, default=250_000)
+    parser.add_argument(
+        "--max-transactions", type=int, default=100_000,
+        help="Use only the first N rows to limit memory; use 0 for the full CSV."
+    )
     parser.add_argument("--output", type=str, default="data/processed/aml_graph.pt")
     parser.add_argument("--directed", action="store_true", help="Do not add reverse edges.")
     args = parser.parse_args()
@@ -315,5 +331,8 @@ if __name__ == "__main__":
     if args.download or source is None:
         source = download_kaggle_dataset(filename=args.filename)
     csv_file = locate_transaction_csv(source, args.filename)
-    build_graph(csv_file, chunksize=args.chunksize,
-                make_undirected=not args.directed, output_path=args.output)
+    build_graph(
+        csv_file, chunksize=args.chunksize, make_undirected=not args.directed,
+        output_path=args.output,
+        max_transactions=args.max_transactions or None,
+    )
