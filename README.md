@@ -35,7 +35,7 @@ pip install kagglehub
 
 Authenticate Kaggle as described by KaggleHub / Kaggle API. Common approaches are setting `KAGGLE_USERNAME` and `KAGGLE_KEY`, or configuring a Kaggle API token in your environment. Never commit credentials or `kaggle.json` to GitHub.
 
-Run training with automatic download (defaults to `HI-Small_Trans.csv`):
+Run training with automatic download (defaults to `HI-Small_Trans.csv`). To keep Codespaces memory use bounded, training defaults to the first 100,000 transactions; this is a quick baseline on a subset, not a full-dataset evaluation.
 
 ```bash
 python train.py
@@ -86,7 +86,7 @@ This is a learning baseline, not a production AML system.
 ## 6. Train
 
 ```bash
-python train.py --epochs 30 --batch-size 1024 --neighbors 15
+python train.py --epochs 30 --batch-size 256 --neighbors 8 --chunksize 50000
 ```
 
 If memory is tight:
@@ -95,7 +95,7 @@ If memory is tight:
 python train.py --batch-size 256 --neighbors 8 --chunksize 50000
 ```
 
-The script uses `NeighborLoader`; depending on your PyG build, neighborhood sampling may require `pyg-lib` or `torch-sparse`. Follow the installation guidance in the PyG documentation for your environment.
+The script uses `NeighborLoader`; depending on your PyG build, neighborhood sampling may require `pyg-lib` or `torch-sparse`. Follow the installation guidance in the PyG documentation for your environment. Increase `--max-transactions` to use a larger prefix, or pass `--max-transactions 0` for the full CSV if your machine has enough memory and time.
 
 ## References
 
